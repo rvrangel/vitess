@@ -20,6 +20,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -549,27 +550,33 @@ func (be *XtrabackupEngine) extractFiles(ctx context.Context, logger logutil.Log
 				if len(decompressorFlags) < 1 {
 					return vterrors.Wrap(err, "external_decompressor is empty")
 				}
-				decompressorCmd = exec.CommandContext(ctx, decompressorFlags[0], decompressorFlags[1:]...)
+
+				decompressorCmdPath, err := validateExternalDecompressor(decompressorFlags[0])
+				if err != nil {
+					return vterrors.Wrap(err, "could not validate external decompressor")
+				}
+
+				decompressorCmd = exec.CommandContext(ctx, decompressorCmdPath, decompressorFlags[1:]...)
 				decompressorCmd.Stdin = reader
 
 				logger.Infof("Decompressing using %v", decompressorFlags)
 
 				decompressorOut, err := decompressorCmd.StdoutPipe()
 				if err != nil {
-					return vterrors.Wrap(err, "cannot create pigz stdout pipe")
+					return vterrors.Wrap(err, "cannot create external decompressor stdout pipe")
 				}
 
 				decompressorErr, err := decompressorCmd.StderrPipe()
 				if err != nil {
-					return vterrors.Wrap(err, "cannot create stderr pipe")
+					return vterrors.Wrap(err, "cannot create external decompressor stderr pipe")
 				}
 
 				if err := decompressorCmd.Start(); err != nil {
-					return vterrors.Wrap(err, "can't start pigz")
+					return vterrors.Wrap(err, "can't start external decompressor")
 				}
 
 				decompressorWg.Add(1)
-				go scanLinesToLogger("xbstream stderr", decompressorErr, logger, decompressorWg.Done)
+				go scanLinesToLogger("decompressor stderr", decompressorErr, logger, decompressorWg.Done)
 
 				decompressor = decompressorOut
 
@@ -581,7 +588,7 @@ func (be *XtrabackupEngine) extractFiles(ctx context.Context, logger logutil.Log
 					}
 				}()
 			default:
-				return vterrors.Wrap(err, "unknown decompressing method")
+				return vterrors.Wrap(err, "unknown decompressor method")
 			}
 
 			srcDecompressors = append(srcDecompressors, decompressor)
@@ -874,6 +881,15 @@ func stripeReader(readers []io.Reader, blockSize int64) io.Reader {
 // xtrabackup can run while tablet is serving, hence false
 func (be *XtrabackupEngine) ShouldDrainForBackup() bool {
 	return false
+}
+
+// Validates if the external decompressor exists and return its path.
+func validateExternalDecompressor(cmd string) (string, error) {
+	if cmd == "" {
+		return "", errors.New("external compressor command is empty")
+	}
+
+	return exec.LookPath(cmd)
 }
 
 func init() {
