@@ -18,8 +18,10 @@ package mysqlctl
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"math/rand"
+	"strings"
 	"testing"
 
 	"vitess.io/vitess/go/vt/logutil"
@@ -114,4 +116,38 @@ func TestStripeRoundTrip(t *testing.T) {
 	test(1000, 30)
 	// Test block size and stripe count that don't evenly divide data size.
 	test(6000, 7)
+}
+
+func TestUsePigzDecompressor(t *testing.T) {
+	tests := []struct {
+		cmdName     string
+		flagEnabled bool
+		path        string
+		ok          bool
+	}{
+		{"non_existent_cmd", false, "", false},
+		{"non_existent_cmd", true, "", false},
+
+		// we expect ls to be on PATH as it is a basic command part of busybox and most containers
+		{"ls", false, "", false},
+		{"ls", true, "ls", true},
+	}
+
+	for i, tt := range tests {
+		t.Run(fmt.Sprintf("Test #%d", i+1), func(t *testing.T) {
+			pigzCmdName, *xtrabackupUsePigz = tt.cmdName, tt.flagEnabled
+
+			path, ok := usePigzDecompressor()
+
+			if tt.path != "" {
+				if !strings.HasSuffix(path, tt.path) {
+					t.Errorf("Expected path \"%s\" to include \"%s\"", path, tt.path)
+				}
+			}
+
+			if tt.ok != ok {
+				t.Errorf("Expected result %v, got %v", tt.ok, ok)
+			}
+		})
+	}
 }

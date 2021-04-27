@@ -63,6 +63,10 @@ var (
 	// striping mode
 	xtrabackupStripes         = flag.Uint("xtrabackup_stripes", 0, "If greater than 0, use data striping across this many destination files to parallelize data transfer and decompression")
 	xtrabackupStripeBlockSize = flag.Uint("xtrabackup_stripe_block_size", 102400, "Size in bytes of each block that gets sent to a given stripe before rotating to the next stripe")
+	// use pigz if available on the host
+	xtrabackupUsePigz = flag.Bool("xtrabackup_use_pigz", false, "use pigz for decompression instead of pgzip")
+
+	pigzCmdName = "pigz"
 )
 
 const (
@@ -519,17 +523,62 @@ func (be *XtrabackupEngine) extractFiles(ctx context.Context, logger logutil.Log
 		}
 	}()
 
+	var (
+		pigzCmd *exec.Cmd
+		pigzWg  sync.WaitGroup
+	)
 	srcReaders := []io.Reader{}
 	srcDecompressors := []io.ReadCloser{}
+
 	for _, file := range srcFiles {
 		reader := io.Reader(file)
 
 		// Create the decompressor if needed.
 		if compressed {
-			decompressor, err := pgzip.NewReader(reader)
-			if err != nil {
-				return vterrors.Wrap(err, "can't create gzip decompressor")
+			var decompressor io.ReadCloser
+
+			if pigzPath, ok := usePigzDecompressor(); ok {
+				pigzFlags := []string{"-d", "-c"}
+				pigzCmd = exec.CommandContext(ctx, pigzPath, pigzFlags...)
+				pigzCmd.Stdin = reader
+
+				logger.Infof("Decompressing using pigz %v", pigzFlags)
+
+				pigzOut, err := pigzCmd.StdoutPipe()
+				if err != nil {
+					return vterrors.Wrap(err, "cannot create pigz stdout pipe")
+				}
+
+				pigzErr, err := pigzCmd.StderrPipe()
+				if err != nil {
+					return vterrors.Wrap(err, "cannot create stderr pipe")
+				}
+
+				if err := pigzCmd.Start(); err != nil {
+					return vterrors.Wrap(err, "can't start pigz")
+				}
+
+				pigzWg.Add(1)
+				go scanLinesToLogger("xbstream stderr", pigzErr, logger, pigzWg.Done)
+
+				decompressor = pigzOut
+
+				defer func() {
+					pigzWg.Wait()
+					// log the exit status
+					if err := pigzCmd.Wait(); err != nil {
+						vterrors.Wrap(err, "pigz failed")
+					}
+				}()
+			} else {
+				logger.Infof("Using built-in decompressor")
+
+				decompressor, err = pgzip.NewReader(reader)
+				if err != nil {
+					return vterrors.Wrap(err, "can't create gzip decompressor")
+				}
 			}
+
 			srcDecompressors = append(srcDecompressors, decompressor)
 			reader = decompressor
 		}
@@ -820,6 +869,17 @@ func stripeReader(readers []io.Reader, blockSize int64) io.Reader {
 // xtrabackup can run while tablet is serving, hence false
 func (be *XtrabackupEngine) ShouldDrainForBackup() bool {
 	return false
+}
+
+// Check if pigz is availabe in the OS to use for decompressing
+// and the flag was provided by the user.
+func usePigzDecompressor() (string, bool) {
+	if *xtrabackupUsePigz {
+		path, err := exec.LookPath(pigzCmdName)
+		return path, err == nil
+	}
+
+	return "", false
 }
 
 func init() {
